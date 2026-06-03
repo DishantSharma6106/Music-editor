@@ -410,9 +410,9 @@ export default function App() {
           <header className="app-header">
             <div className="app-logo">
               <div className="logo-icon">🎧</div>
-              <h1 className="app-title">Reverb Lab</h1>
+              <h1 className="app-title">Reverie</h1>
             </div>
-            <p className="app-subtitle">Transform any track into a masterpiece</p>
+            <p className="app-subtitle">Drift into sound</p>
           </header>
 
           {!file ? (

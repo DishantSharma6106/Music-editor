@@ -1,6 +1,6 @@
-# 🎧 Reverb Lab
+# 🎧 Reverie
 
-A premium browser-based music editor that transforms any audio track with real-time effects. No uploads to servers — everything runs locally in your browser using the Web Audio API.
+**Drift into sound.** A premium browser-based music editor that transforms any audio track with real-time effects. No uploads to servers — everything runs locally in your browser using the Web Audio API.
 
 ![Built with React](https://img.shields.io/badge/React-19-61DAFB?style=flat-square&logo=react)
 ![TypeScript](https://img.shields.io/badge/TypeScript-6.0-3178C6?style=flat-square&logo=typescript)
