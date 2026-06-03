@@ -1,348 +1,558 @@
-import { useState, useRef, useEffect, ChangeEvent } from 'react';
+import { useState, useRef, useEffect, useCallback, type ChangeEvent } from 'react';
 import './index.css';
 
-// Utility to generate a synthetic impulse response for the ConvolverNode
-function createImpulseResponse(audioContext: AudioContext, duration: number, decay: number) {
-  const sampleRate = audioContext.sampleRate;
-  const length = sampleRate * duration;
-  const impulse = audioContext.createBuffer(2, length, sampleRate);
-  
-  for (let i = 0; i < 2; i++) {
-    const channel = impulse.getChannelData(i);
-    for (let j = 0; j < length; j++) {
-      channel[j] = (Math.random() * 2 - 1) * Math.pow(1 - j / length, decay);
-    }
-  }
-  return impulse;
+/* ─── Types ─── */
+interface Effects {
+  speed: number;
+  reverb: number;
+  filterFreq: number;
+  bassBoost: number;
+  volume: number;
 }
 
-function App() {
+interface Preset {
+  id: string;
+  name: string;
+  icon: string;
+  desc: string;
+  settings: Effects;
+}
+
+/* ─── Constants ─── */
+const DEFAULT_EFFECTS: Effects = {
+  speed: 1.0, reverb: 0, filterFreq: 20000, bassBoost: 0, volume: 1.0,
+};
+
+const PRESETS: Preset[] = [
+  { id: 'slowed', name: 'Slowed + Reverb', icon: '🌙', desc: 'Late night vibes',
+    settings: { speed: 0.85, reverb: 0.6, filterFreq: 2500, bassBoost: 5, volume: 1.0 } },
+  { id: 'lofi', name: 'Lo-Fi Chill', icon: '☕', desc: 'Study beats',
+    settings: { speed: 0.92, reverb: 0.35, filterFreq: 1200, bassBoost: 3, volume: 0.9 } },
+  { id: 'bass', name: 'Bass Cave', icon: '🔊', desc: 'Heavy bass',
+    settings: { speed: 0.95, reverb: 0.25, filterFreq: 5000, bassBoost: 18, volume: 0.85 } },
+  { id: 'night', name: 'Nightcore', icon: '⚡', desc: 'Speed up',
+    settings: { speed: 1.3, reverb: 0.2, filterFreq: 18000, bassBoost: 0, volume: 1.0 } },
+  { id: 'underwater', name: 'Underwater', icon: '🫧', desc: 'Deep & muffled',
+    settings: { speed: 0.75, reverb: 0.8, filterFreq: 800, bassBoost: 8, volume: 0.8 } },
+  { id: 'clean', name: 'Clean', icon: '✨', desc: 'No effects',
+    settings: { ...DEFAULT_EFFECTS } },
+];
+
+/* ─── Utilities ─── */
+function createImpulse(ctx: BaseAudioContext, dur: number, decay: number) {
+  const len = ctx.sampleRate * dur;
+  const buf = ctx.createBuffer(2, len, ctx.sampleRate);
+  for (let ch = 0; ch < 2; ch++) {
+    const d = buf.getChannelData(ch);
+    for (let i = 0; i < len; i++) d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / len, decay);
+  }
+  return buf;
+}
+
+function formatTime(s: number) {
+  if (!isFinite(s) || s < 0) return '0:00';
+  const m = Math.floor(s / 60);
+  const sec = Math.floor(s % 60);
+  return `${m}:${sec.toString().padStart(2, '0')}`;
+}
+
+function encodeWAV(buf: AudioBuffer) {
+  const nCh = buf.numberOfChannels, sr = buf.sampleRate, bits = 16;
+  let inter: Float32Array;
+  if (nCh === 2) {
+    const L = buf.getChannelData(0), R = buf.getChannelData(1);
+    inter = new Float32Array(L.length * 2);
+    for (let i = 0, j = 0; i < L.length; i++) { inter[j++] = L[i]; inter[j++] = R[i]; }
+  } else { inter = buf.getChannelData(0); }
+  const dLen = inter.length * 2;
+  const ab = new ArrayBuffer(44 + dLen);
+  const v = new DataView(ab);
+  const ws = (o: number, s: string) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
+  ws(0, 'RIFF'); v.setUint32(4, 36 + dLen, true); ws(8, 'WAVE');
+  ws(12, 'fmt '); v.setUint32(16, 16, true); v.setUint16(20, 1, true);
+  v.setUint16(22, nCh, true); v.setUint32(24, sr, true);
+  v.setUint32(28, sr * nCh * 2, true); v.setUint16(32, nCh * 2, true); v.setUint16(34, bits, true);
+  ws(36, 'data'); v.setUint32(40, dLen, true);
+  let off = 44;
+  for (let i = 0; i < inter.length; i++, off += 2) {
+    const s = Math.max(-1, Math.min(1, inter[i]));
+    v.setInt16(off, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+  }
+  return ab;
+}
+
+/* ─── App ─── */
+export default function App() {
   const [file, setFile] = useState<File | null>(null);
   const [isPlaying, setIsPlaying] = useState(false);
   const [isReady, setIsReady] = useState(false);
-  
-  // Effects parameters
-  const [speed, setSpeed] = useState(0.85); // 0.5 to 1.5
-  const [reverb, setReverb] = useState(0.6); // 0 to 1
-  const [filterFreq, setFilterFreq] = useState(2500); // 500 to 20000
+  const [currentTime, setCurTime] = useState(0);
+  const [duration, setDuration] = useState(0);
+  const [activePreset, setActivePreset] = useState<string | null>(null);
+  const [isDragging, setIsDragging] = useState(false);
+  const [isExporting, setIsExporting] = useState(false);
+  const [fx, setFx] = useState<Effects>({ ...DEFAULT_EFFECTS });
 
-  const audioCtxRef = useRef<AudioContext | null>(null);
-  const bufferRef = useRef<AudioBuffer | null>(null);
-  const sourceRef = useRef<AudioBufferSourceNode | null>(null);
-  
-  const filterNodeRef = useRef<BiquadFilterNode | null>(null);
-  const convolverRef = useRef<ConvolverNode | null>(null);
-  const dryGainRef = useRef<GainNode | null>(null);
-  const wetGainRef = useRef<GainNode | null>(null);
+  // Audio refs
+  const ctxRef = useRef<AudioContext | null>(null);
+  const bufRef = useRef<AudioBuffer | null>(null);
+  const srcRef = useRef<AudioBufferSourceNode | null>(null);
+  const filterRef = useRef<BiquadFilterNode | null>(null);
+  const bassRef = useRef<BiquadFilterNode | null>(null);
+  const convRef = useRef<ConvolverNode | null>(null);
+  const dryRef = useRef<GainNode | null>(null);
+  const wetRef = useRef<GainNode | null>(null);
+  const masterRef = useRef<GainNode | null>(null);
+  const analyserRef = useRef<AnalyserNode | null>(null);
+  const startTRef = useRef(0);
+  const pausedRef = useRef(0);
+  const rafRef = useRef(0);
 
-  const startTimeRef = useRef(0);
-  const pausedAtRef = useRef(0);
+  // Canvas refs
+  const waveCanvasRef = useRef<HTMLCanvasElement>(null);
+  const specCanvasRef = useRef<HTMLCanvasElement>(null);
 
-  // Initialize Audio Context and Nodes
+  // Init audio context
   useEffect(() => {
-    const ctx = new (window.AudioContext || (window as any).webkitAudioContext)();
-    audioCtxRef.current = ctx;
+    const ctx = new AudioContext();
+    const bass = ctx.createBiquadFilter(); bass.type = 'peaking'; bass.frequency.value = 80; bass.Q.value = 1.2; bass.gain.value = 0;
+    const filt = ctx.createBiquadFilter(); filt.type = 'lowpass'; filt.frequency.value = 20000;
+    const conv = ctx.createConvolver(); conv.buffer = createImpulse(ctx, 3.0, 2.0);
+    const dry = ctx.createGain(); const wet = ctx.createGain(); wet.gain.value = 0;
+    const master = ctx.createGain();
+    const analyser = ctx.createAnalyser(); analyser.fftSize = 256; analyser.smoothingTimeConstant = 0.8;
 
-    const filter = ctx.createBiquadFilter();
-    filter.type = 'lowpass';
-    
-    const convolver = ctx.createConvolver();
-    // Create a 3 second reverb with decay 2.0
-    convolver.buffer = createImpulseResponse(ctx, 3.0, 2.0);
+    bass.connect(filt);
+    filt.connect(dry); filt.connect(conv);
+    conv.connect(wet);
+    dry.connect(master); wet.connect(master);
+    master.connect(analyser); analyser.connect(ctx.destination);
 
-    const dryGain = ctx.createGain();
-    const wetGain = ctx.createGain();
+    ctxRef.current = ctx; bassRef.current = bass; filterRef.current = filt;
+    convRef.current = conv; dryRef.current = dry; wetRef.current = wet;
+    masterRef.current = master; analyserRef.current = analyser;
 
-    // Routing
-    filter.connect(dryGain);
-    filter.connect(convolver);
-    convolver.connect(wetGain);
-    
-    dryGain.connect(ctx.destination);
-    wetGain.connect(ctx.destination);
-
-    filterNodeRef.current = filter;
-    convolverRef.current = convolver;
-    dryGainRef.current = dryGain;
-    wetGainRef.current = wetGain;
-
-    return () => {
-      ctx.close();
-    };
+    return () => { ctx.close(); };
   }, []);
 
-  // Update effect parameters in real-time
+  // Update FX params live
   useEffect(() => {
-    if (sourceRef.current) {
-      sourceRef.current.playbackRate.setTargetAtTime(speed, audioCtxRef.current!.currentTime, 0.1);
+    const ctx = ctxRef.current;
+    if (!ctx) return;
+    const t = ctx.currentTime;
+    if (srcRef.current) srcRef.current.playbackRate.setTargetAtTime(fx.speed, t, 0.08);
+    if (filterRef.current) filterRef.current.frequency.setTargetAtTime(fx.filterFreq, t, 0.08);
+    if (bassRef.current) bassRef.current.gain.setTargetAtTime(fx.bassBoost, t, 0.08);
+    if (masterRef.current) masterRef.current.gain.setTargetAtTime(fx.volume, t, 0.08);
+    if (dryRef.current && wetRef.current) {
+      dryRef.current.gain.setTargetAtTime(Math.cos(fx.reverb * 0.5 * Math.PI), t, 0.08);
+      wetRef.current.gain.setTargetAtTime(Math.cos((1 - fx.reverb) * 0.5 * Math.PI), t, 0.08);
     }
-    if (filterNodeRef.current) {
-      filterNodeRef.current.frequency.setTargetAtTime(filterFreq, audioCtxRef.current!.currentTime, 0.1);
-    }
-    if (dryGainRef.current && wetGainRef.current) {
-      // Equal power crossfade
-      const dryVal = Math.cos(reverb * 0.5 * Math.PI);
-      const wetVal = Math.cos((1.0 - reverb) * 0.5 * Math.PI);
-      dryGainRef.current.gain.setTargetAtTime(dryVal, audioCtxRef.current!.currentTime, 0.1);
-      wetGainRef.current.gain.setTargetAtTime(wetVal, audioCtxRef.current!.currentTime, 0.1);
-    }
-  }, [speed, reverb, filterFreq]);
+  }, [fx]);
 
-  const handleFileUpload = async (e: ChangeEvent<HTMLInputElement>) => {
-    const uploadedFile = e.target.files?.[0];
-    if (!uploadedFile) return;
-    
-    setFile(uploadedFile);
-    setIsReady(false);
-    setIsPlaying(false);
-    if (sourceRef.current) {
-      sourceRef.current.stop();
-      sourceRef.current.disconnect();
-    }
-    pausedAtRef.current = 0;
-
-    const reader = new FileReader();
-    reader.onload = async (ev) => {
-      const arrayBuffer = ev.target?.result as ArrayBuffer;
-      if (audioCtxRef.current) {
-        const decodedBuffer = await audioCtxRef.current.decodeAudioData(arrayBuffer);
-        bufferRef.current = decodedBuffer;
-        setIsReady(true);
+  // Keyboard shortcut
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if (e.code === 'Space' && isReady && e.target === document.body) {
+        e.preventDefault();
+        togglePlay();
       }
     };
-    reader.readAsArrayBuffer(uploadedFile);
-  };
+    window.addEventListener('keydown', handler);
+    return () => window.removeEventListener('keydown', handler);
+  });
 
-  const togglePlay = () => {
-    if (!audioCtxRef.current || !bufferRef.current || !filterNodeRef.current) return;
-    const ctx = audioCtxRef.current;
+  // Draw waveform
+  const drawWaveform = useCallback(() => {
+    const canvas = waveCanvasRef.current;
+    const buffer = bufRef.current;
+    if (!canvas || !buffer) return;
+    const c = canvas.getContext('2d')!;
+    const dpr = window.devicePixelRatio || 1;
+    const rect = canvas.getBoundingClientRect();
+    canvas.width = rect.width * dpr;
+    canvas.height = rect.height * dpr;
+    c.scale(dpr, dpr);
+    const W = rect.width, H = rect.height;
+    c.clearRect(0, 0, W, H);
 
-    if (ctx.state === 'suspended') {
-      ctx.resume();
+    const data = buffer.getChannelData(0);
+    const barW = 3, gap = 1.5;
+    const bars = Math.floor(W / (barW + gap));
+    const samplesPerBar = Math.floor(data.length / bars);
+    const progress = duration > 0 ? currentTime / duration : 0;
+    const half = H / 2;
+
+    for (let i = 0; i < bars; i++) {
+      let sum = 0;
+      for (let j = 0; j < samplesPerBar; j++) { const s = data[i * samplesPerBar + j] || 0; sum += s * s; }
+      const rms = Math.sqrt(sum / samplesPerBar);
+      const h = Math.max(2, rms * H * 2.5);
+      const x = i * (barW + gap);
+      const frac = i / bars;
+      if (frac <= progress) {
+        c.fillStyle = `rgba(139, 92, 246, ${0.6 + rms * 0.8})`;
+      } else {
+        c.fillStyle = `rgba(255, 255, 255, ${0.08 + rms * 0.15})`;
+      }
+      c.beginPath();
+      c.roundRect(x, half - h / 2, barW, h, 1.5);
+      c.fill();
     }
 
+    if (progress > 0 && progress < 1) {
+      const px = progress * W;
+      c.save();
+      c.shadowColor = '#8b5cf6'; c.shadowBlur = 8;
+      c.strokeStyle = 'rgba(255,255,255,0.9)'; c.lineWidth = 1.5;
+      c.beginPath(); c.moveTo(px, 4); c.lineTo(px, H - 4); c.stroke();
+      c.restore();
+    }
+  }, [currentTime, duration]);
+
+  // Draw spectrum
+  const drawSpectrum = useCallback(() => {
+    const canvas = specCanvasRef.current;
+    const analyser = analyserRef.current;
+    if (!canvas || !analyser) return;
+    const c = canvas.getContext('2d')!;
+    const dpr = window.devicePixelRatio || 1;
+    const rect = canvas.getBoundingClientRect();
+    canvas.width = rect.width * dpr;
+    canvas.height = rect.height * dpr;
+    c.scale(dpr, dpr);
+    const W = rect.width, H = rect.height;
+
+    const freqData = new Uint8Array(analyser.frequencyBinCount);
+    analyser.getByteFrequencyData(freqData);
+    c.clearRect(0, 0, W, H);
+
+    const bars = 48;
+    const barW = W / bars - 2;
+    for (let i = 0; i < bars; i++) {
+      const idx = Math.floor(i * freqData.length / bars);
+      const v = freqData[idx] / 255;
+      const h = Math.max(1, v * H * 0.9);
+      const x = i * (barW + 2) + 1;
+      const grad = c.createLinearGradient(0, H, 0, H - h);
+      grad.addColorStop(0, 'rgba(139,92,246,0.7)');
+      grad.addColorStop(1, `rgba(236,72,153,${0.3 + v * 0.5})`);
+      c.fillStyle = grad;
+      c.beginPath();
+      c.roundRect(x, H - h, barW, h, 2);
+      c.fill();
+    }
+  }, []);
+
+  // Animation loop
+  useEffect(() => {
+    let active = true;
+    const tick = () => {
+      if (!active) return;
+      if (isPlaying && ctxRef.current && bufRef.current) {
+        const elapsed = (ctxRef.current.currentTime - startTRef.current) * fx.speed;
+        const pos = pausedRef.current + elapsed;
+        if (pos < bufRef.current.duration) {
+          setCurTime(pos);
+        }
+      }
+      drawWaveform();
+      if (isPlaying) drawSpectrum();
+      rafRef.current = requestAnimationFrame(tick);
+    };
+    rafRef.current = requestAnimationFrame(tick);
+    return () => { active = false; cancelAnimationFrame(rafRef.current); };
+  }, [isPlaying, drawWaveform, drawSpectrum, fx.speed]);
+
+  // File loading
+  const loadFile = async (f: File) => {
+    setFile(f); setIsReady(false); setIsPlaying(false); setActivePreset(null);
+    if (srcRef.current) { try { srcRef.current.stop(); } catch {} srcRef.current.disconnect(); }
+    pausedRef.current = 0; setCurTime(0);
+
+    const ab = await f.arrayBuffer();
+    const ctx = ctxRef.current!;
+    if (ctx.state === 'suspended') await ctx.resume();
+    const decoded = await ctx.decodeAudioData(ab);
+    bufRef.current = decoded;
+    setDuration(decoded.duration);
+    setIsReady(true);
+  };
+
+  const handleUpload = (e: ChangeEvent<HTMLInputElement>) => {
+    const f = e.target.files?.[0]; if (f) loadFile(f);
+  };
+
+  const handleDrop = (e: React.DragEvent) => {
+    e.preventDefault(); setIsDragging(false);
+    const f = e.dataTransfer.files[0]; if (f && f.type.startsWith('audio/')) loadFile(f);
+  };
+
+  // Playback
+  const startPlayback = useCallback((offset: number) => {
+    const ctx = ctxRef.current, buf = bufRef.current, bass = bassRef.current;
+    if (!ctx || !buf || !bass) return;
+    const src = ctx.createBufferSource();
+    src.buffer = buf; src.playbackRate.value = fx.speed;
+    src.connect(bass);
+    src.start(0, offset);
+    startTRef.current = ctx.currentTime;
+    pausedRef.current = offset;
+    srcRef.current = src;
+    src.onended = () => { if (srcRef.current === src) { setIsPlaying(false); pausedRef.current = 0; setCurTime(0); } };
+    setIsPlaying(true);
+  }, [fx.speed]);
+
+  const togglePlay = useCallback(() => {
+    if (!ctxRef.current || !bufRef.current || !isReady) return;
+    if (ctxRef.current.state === 'suspended') ctxRef.current.resume();
     if (isPlaying) {
-      // Pause
-      sourceRef.current?.stop();
-      pausedAtRef.current += (ctx.currentTime - startTimeRef.current) * speed;
+      srcRef.current?.stop();
+      const elapsed = (ctxRef.current.currentTime - startTRef.current) * fx.speed;
+      pausedRef.current += elapsed;
       setIsPlaying(false);
     } else {
-      // Play
-      const source = ctx.createBufferSource();
-      source.buffer = bufferRef.current;
-      source.playbackRate.value = speed;
-      source.connect(filterNodeRef.current);
-      
-      const offset = pausedAtRef.current % bufferRef.current.duration;
-      source.start(0, offset);
-      
-      startTimeRef.current = ctx.currentTime;
-      sourceRef.current = source;
-      
-      source.onended = () => {
-        if (sourceRef.current === source) {
-           setIsPlaying(false);
-           pausedAtRef.current = 0;
-        }
-      };
-
-      setIsPlaying(true);
+      const off = pausedRef.current % bufRef.current.duration;
+      startPlayback(off);
     }
+  }, [isPlaying, isReady, fx.speed, startPlayback]);
+
+  const handleSeek = (e: React.MouseEvent<HTMLDivElement>) => {
+    if (!bufRef.current || !isReady) return;
+    const rect = e.currentTarget.getBoundingClientRect();
+    const frac = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+    const t = frac * bufRef.current.duration;
+    const wasPlaying = isPlaying;
+    if (isPlaying) { try { srcRef.current?.stop(); } catch {} setIsPlaying(false); }
+    pausedRef.current = t; setCurTime(t);
+    if (wasPlaying) startPlayback(t);
   };
 
+  const handleWaveSeek = (e: React.MouseEvent<HTMLCanvasElement>) => {
+    if (!bufRef.current || !isReady) return;
+    const rect = e.currentTarget.getBoundingClientRect();
+    const frac = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+    const t = frac * bufRef.current.duration;
+    const wasPlaying = isPlaying;
+    if (isPlaying) { try { srcRef.current?.stop(); } catch {} setIsPlaying(false); }
+    pausedRef.current = t; setCurTime(t);
+    if (wasPlaying) startPlayback(t);
+  };
+
+  const skipBy = (sec: number) => {
+    if (!bufRef.current) return;
+    const wasPlaying = isPlaying;
+    if (isPlaying) { try { srcRef.current?.stop(); } catch {} setIsPlaying(false); }
+    const elapsed = isPlaying && ctxRef.current
+      ? (ctxRef.current.currentTime - startTRef.current) * fx.speed
+      : 0;
+    const cur = pausedRef.current + elapsed;
+    const next = Math.max(0, Math.min(bufRef.current.duration, cur + sec));
+    pausedRef.current = next; setCurTime(next);
+    if (wasPlaying) startPlayback(next);
+  };
+
+  // Presets
+  const applyPreset = (p: Preset) => {
+    setFx({ ...p.settings }); setActivePreset(p.id);
+  };
+
+  // Export
   const handleExport = async () => {
-    if (!bufferRef.current || !audioCtxRef.current) return;
-    
-    const duration = bufferRef.current.duration / speed + 3.0; // add tail for reverb
-    const offlineCtx = new OfflineAudioContext(2, 44100 * duration, 44100);
-
-    // Setup offline nodes
-    const source = offlineCtx.createBufferSource();
-    source.buffer = bufferRef.current;
-    source.playbackRate.value = speed;
-
-    const filter = offlineCtx.createBiquadFilter();
-    filter.type = 'lowpass';
-    filter.frequency.value = filterFreq;
-
-    const convolver = offlineCtx.createConvolver();
-    convolver.buffer = createImpulseResponse(offlineCtx, 3.0, 2.0);
-
-    const dryGain = offlineCtx.createGain();
-    const wetGain = offlineCtx.createGain();
-    
-    const dryVal = Math.cos(reverb * 0.5 * Math.PI);
-    const wetVal = Math.cos((1.0 - reverb) * 0.5 * Math.PI);
-    dryGain.gain.value = dryVal;
-    wetGain.gain.value = wetVal;
-
-    // Routing
-    source.connect(filter);
-    filter.connect(dryGain);
-    filter.connect(convolver);
-    convolver.connect(wetGain);
-    
-    dryGain.connect(offlineCtx.destination);
-    wetGain.connect(offlineCtx.destination);
-
-    source.start(0);
-
+    if (!bufRef.current) return;
+    setIsExporting(true);
     try {
-      const renderedBuffer = await offlineCtx.startRendering();
-      // Convert AudioBuffer to WAV
-      const wavData = encodeWAV(renderedBuffer);
-      const blob = new Blob([new DataView(wavData)], { type: 'audio/wav' });
-      const url = window.URL.createObjectURL(blob);
-      
+      const dur = bufRef.current.duration / fx.speed + 3;
+      const off = new OfflineAudioContext(2, 44100 * dur, 44100);
+      const src = off.createBufferSource(); src.buffer = bufRef.current; src.playbackRate.value = fx.speed;
+      const bass = off.createBiquadFilter(); bass.type = 'peaking'; bass.frequency.value = 80; bass.Q.value = 1.2; bass.gain.value = fx.bassBoost;
+      const filt = off.createBiquadFilter(); filt.type = 'lowpass'; filt.frequency.value = fx.filterFreq;
+      const conv = off.createConvolver(); conv.buffer = createImpulse(off, 3, 2);
+      const dry = off.createGain(); dry.gain.value = Math.cos(fx.reverb * 0.5 * Math.PI);
+      const wet = off.createGain(); wet.gain.value = Math.cos((1 - fx.reverb) * 0.5 * Math.PI);
+      const master = off.createGain(); master.gain.value = fx.volume;
+      src.connect(bass); bass.connect(filt);
+      filt.connect(dry); filt.connect(conv);
+      conv.connect(wet);
+      dry.connect(master); wet.connect(master);
+      master.connect(off.destination);
+      src.start(0);
+      const rendered = await off.startRendering();
+      const wav = encodeWAV(rendered);
+      const blob = new Blob([new DataView(wav)], { type: 'audio/wav' });
+      const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
-      a.style.display = 'none';
-      a.href = url;
-      a.download = `${file?.name.split('.')[0]}_slowed_reverb.wav`;
-      document.body.appendChild(a);
-      a.click();
-      window.URL.revokeObjectURL(url);
-    } catch(e) {
-      console.error("Export failed", e);
-    }
+      a.href = url; a.download = `${file?.name.split('.')[0] || 'track'}_edited.wav`;
+      document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
+    } catch (err) { console.error('Export failed', err); }
+    setIsExporting(false);
   };
 
+  const setEffect = (key: keyof Effects, val: number) => {
+    setFx(prev => ({ ...prev, [key]: val }));
+    setActivePreset(null);
+  };
+
+  const progress = duration > 0 ? (currentTime / duration) * 100 : 0;
+
+  /* ─── Render ─── */
   return (
-    <div className="container">
-      <header>
-        <h1>Slowed + Reverb</h1>
-        <p className="subtitle">Transform any track into a late-night vibe</p>
-      </header>
+    <>
+      <div className="bg-orbs">
+        <div className="bg-orb bg-orb--1" />
+        <div className="bg-orb bg-orb--2" />
+        <div className="bg-orb bg-orb--3" />
+      </div>
 
-      {!file ? (
-        <label className="upload-area">
-          <input type="file" accept="audio/*" className="hidden-input" onChange={handleFileUpload} />
-          <div className="upload-icon">🎧</div>
-          <div className="upload-text">Click or Drop audio file here</div>
-          <div className="upload-subtext">Supports MP3, WAV, FLAC</div>
-        </label>
-      ) : (
-        <>
-          <div className="track-info">
-            <div className="track-icon">🎵</div>
-            <div className="track-details">
-              <div className="track-name">{file.name}</div>
-              <div className="track-time">{isReady ? 'Ready to play' : 'Processing audio...'}</div>
+      <div className="app">
+        <div className="main-panel">
+          {/* Header */}
+          <header className="app-header">
+            <div className="app-logo">
+              <div className="logo-icon">🎧</div>
+              <h1 className="app-title">Reverb Lab</h1>
             </div>
-            <label style={{cursor: 'pointer', color: 'var(--accent)', fontSize: '0.9rem'}}>
-              Change Track
-              <input type="file" accept="audio/*" className="hidden-input" onChange={handleFileUpload} />
+            <p className="app-subtitle">Transform any track into a masterpiece</p>
+          </header>
+
+          {!file ? (
+            /* Upload Zone */
+            <label
+              className={`upload-zone ${isDragging ? 'dragging' : ''}`}
+              onDragOver={e => { e.preventDefault(); setIsDragging(true); }}
+              onDragLeave={() => setIsDragging(false)}
+              onDrop={handleDrop}
+            >
+              <input type="file" accept="audio/*" className="hidden-input" onChange={handleUpload} />
+              <div className="upload-icon">🎵</div>
+              <div className="upload-title">Drop your track here</div>
+              <div className="upload-subtitle">or click to browse · <span>MP3, WAV, FLAC, OGG</span></div>
             </label>
-          </div>
-
-          <div className="controls-section">
-            <div className="control-group">
-              <div className="control-header">
-                <span>Speed / Pitch</span>
-                <span className="control-value">{speed.toFixed(2)}x</span>
+          ) : (
+            <>
+              {/* Track Bar */}
+              <div className="track-bar">
+                <div className="track-art">🎵</div>
+                <div className="track-meta">
+                  <div className="track-name">{file.name}</div>
+                  <div className={`track-status ${isReady ? 'ready' : ''}`}>
+                    {isReady ? `Ready · ${formatTime(duration)}` : 'Decoding audio...'}
+                  </div>
+                </div>
+                <label className="change-track-btn">
+                  Change
+                  <input type="file" accept="audio/*" className="hidden-input" onChange={handleUpload} />
+                </label>
               </div>
-              <input 
-                type="range" min="0.5" max="1.5" step="0.01" 
-                value={speed} onChange={e => setSpeed(parseFloat(e.target.value))} 
-                disabled={!isReady}
-              />
-            </div>
 
-            <div className="control-group">
-              <div className="control-header">
-                <span>Reverb Intensity</span>
-                <span className="control-value">{Math.round(reverb * 100)}%</span>
+              {/* Visualizer */}
+              <div className="visualizer-section">
+                <div className="waveform-container">
+                  <canvas ref={waveCanvasRef} className="waveform-canvas" onClick={handleWaveSeek} />
+                </div>
+                <canvas ref={specCanvasRef} className="spectrum-canvas" />
               </div>
-              <input 
-                type="range" min="0" max="1" step="0.01" 
-                value={reverb} onChange={e => setReverb(parseFloat(e.target.value))}
-                disabled={!isReady}
-              />
-            </div>
 
-            <div className="control-group">
-              <div className="control-header">
-                <span>Low-pass Filter (Muffle)</span>
-                <span className="control-value">{filterFreq} Hz</span>
+              {/* Transport */}
+              <div className="transport">
+                <div className="time-row">
+                  <span className="time-current">{formatTime(currentTime)}</span>
+                  <span>{formatTime(duration)}</span>
+                </div>
+                <div className="progress-bar-wrapper" onClick={handleSeek}>
+                  <div className="progress-bar-fill" style={{ width: `${progress}%` }} />
+                </div>
+                <div className="transport-buttons">
+                  <button className="btn-transport" onClick={() => skipBy(-10)} disabled={!isReady} title="Back 10s">⏪</button>
+                  <button className="btn-transport btn-play-main" onClick={togglePlay} disabled={!isReady}>
+                    {isPlaying ? '⏸' : '▶'}
+                  </button>
+                  <button className="btn-transport" onClick={() => skipBy(10)} disabled={!isReady} title="Forward 10s">⏩</button>
+                </div>
               </div>
-              <input 
-                type="range" min="500" max="20000" step="100" 
-                value={filterFreq} onChange={e => setFilterFreq(parseFloat(e.target.value))}
-                disabled={!isReady}
-              />
-            </div>
-          </div>
 
-          <div className="action-buttons">
-            <button className="btn-play" onClick={togglePlay} disabled={!isReady}>
-              {isPlaying ? '⏸ Pause' : '▶ Play'}
-            </button>
-            <button className="btn-export" onClick={handleExport} disabled={!isReady}>
-              ⬇ Export WAV
-            </button>
-          </div>
-        </>
-      )}
-    </div>
+              {/* Presets */}
+              <div className="presets-section">
+                <div className="section-label">Presets</div>
+                <div className="presets-grid">
+                  {PRESETS.map(p => (
+                    <button key={p.id} className={`preset-card ${activePreset === p.id ? 'active' : ''}`} onClick={() => applyPreset(p)}>
+                      <div className="preset-icon">{p.icon}</div>
+                      <div className="preset-name">{p.name}</div>
+                      <div className="preset-desc">{p.desc}</div>
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              {/* Effects */}
+              <div className="effects-section">
+                <div className="section-label">Effects</div>
+
+                <div className="effect-row">
+                  <div className="effect-header">
+                    <span className="effect-label"><span className="effect-label-icon">🐌</span> Speed / Pitch</span>
+                    <span className="effect-value">{fx.speed.toFixed(2)}x</span>
+                  </div>
+                  <input type="range" min="0.5" max="1.5" step="0.01" value={fx.speed}
+                    onChange={e => setEffect('speed', +e.target.value)} disabled={!isReady} />
+                </div>
+
+                <div className="effect-row">
+                  <div className="effect-header">
+                    <span className="effect-label"><span className="effect-label-icon">🌊</span> Reverb</span>
+                    <span className="effect-value">{Math.round(fx.reverb * 100)}%</span>
+                  </div>
+                  <input type="range" min="0" max="1" step="0.01" value={fx.reverb}
+                    onChange={e => setEffect('reverb', +e.target.value)} disabled={!isReady} />
+                </div>
+
+                <div className="effect-row">
+                  <div className="effect-header">
+                    <span className="effect-label"><span className="effect-label-icon">🎚️</span> Low-pass Filter</span>
+                    <span className="effect-value">{fx.filterFreq >= 1000 ? `${(fx.filterFreq / 1000).toFixed(1)}k` : fx.filterFreq} Hz</span>
+                  </div>
+                  <input type="range" min="200" max="20000" step="100" value={fx.filterFreq}
+                    onChange={e => setEffect('filterFreq', +e.target.value)} disabled={!isReady} />
+                </div>
+
+                <div className="effect-row">
+                  <div className="effect-header">
+                    <span className="effect-label"><span className="effect-label-icon">💥</span> Bass Boost</span>
+                    <span className="effect-value">{fx.bassBoost} dB</span>
+                  </div>
+                  <input type="range" min="0" max="24" step="1" value={fx.bassBoost}
+                    onChange={e => setEffect('bassBoost', +e.target.value)} disabled={!isReady} />
+                </div>
+
+                <div className="effect-row">
+                  <div className="effect-header">
+                    <span className="effect-label"><span className="effect-label-icon">🔉</span> Volume</span>
+                    <span className="effect-value">{Math.round(fx.volume * 100)}%</span>
+                  </div>
+                  <input type="range" min="0" max="1.5" step="0.01" value={fx.volume}
+                    onChange={e => setEffect('volume', +e.target.value)} disabled={!isReady} />
+                </div>
+              </div>
+
+              {/* Actions */}
+              <div className="actions-row">
+                <button className={`btn-export ${isExporting ? 'exporting' : ''}`}
+                  onClick={handleExport} disabled={!isReady || isExporting}>
+                  {isExporting ? <><div className="spinner" /> Rendering...</> : <>⬇ Export WAV</>}
+                </button>
+                <button className="btn-reset" onClick={() => { setFx({ ...DEFAULT_EFFECTS }); setActivePreset(null); }}>
+                  Reset
+                </button>
+              </div>
+
+              <div className="keyboard-hint">
+                Press <kbd>Space</kbd> to play/pause
+              </div>
+            </>
+          )}
+        </div>
+      </div>
+    </>
   );
 }
-
-// Helper to encode AudioBuffer to WAV format
-function encodeWAV(samples: AudioBuffer) {
-  const numChannels = samples.numberOfChannels;
-  const sampleRate = samples.sampleRate;
-  const format = 1; // PCM
-  const bitDepth = 16;
-  
-  let interleaved;
-  if (numChannels === 2) {
-    const left = samples.getChannelData(0);
-    const right = samples.getChannelData(1);
-    interleaved = new Float32Array(left.length + right.length);
-    for (let i = 0, j = 0; i < left.length; i++) {
-      interleaved[j++] = left[i];
-      interleaved[j++] = right[i];
-    }
-  } else {
-    interleaved = samples.getChannelData(0);
-  }
-
-  const dataLength = interleaved.length * (bitDepth / 8);
-  const buffer = new ArrayBuffer(44 + dataLength);
-  const view = new DataView(buffer);
-
-  // RIFF chunk descriptor
-  writeString(view, 0, 'RIFF');
-  view.setUint32(4, 36 + dataLength, true);
-  writeString(view, 8, 'WAVE');
-  
-  // FMT sub-chunk
-  writeString(view, 12, 'fmt ');
-  view.setUint32(16, 16, true);
-  view.setUint16(20, format, true);
-  view.setUint16(22, numChannels, true);
-  view.setUint32(24, sampleRate, true);
-  view.setUint32(28, sampleRate * numChannels * (bitDepth / 8), true);
-  view.setUint16(32, numChannels * (bitDepth / 8), true);
-  view.setUint16(34, bitDepth, true);
-  
-  // Data sub-chunk
-  writeString(view, 36, 'data');
-  view.setUint32(40, dataLength, true);
-
-  // Write PCM samples
-  let offset = 44;
-  for (let i = 0; i < interleaved.length; i++, offset += 2) {
-    let s = Math.max(-1, Math.min(1, interleaved[i]));
-    view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
-  }
-
-  return buffer;
-}
-
-function writeString(view: DataView, offset: number, string: string) {
-  for (let i = 0; i < string.length; i++) {
-    view.setUint8(offset + i, string.charCodeAt(i));
-  }
-}
-
-export default App;
